@@ -10,6 +10,7 @@ services:
       REDIS_HOST: ${REDIS_HOST:-redis}
       REDIS_PORT: ${REDIS_PORT:-6379}
       REDIS_TTL_SECONDS: ${REDIS_TTL_SECONDS:-300}
+      MAX_UPLOAD_SIZE_BYTES: ${MAX_UPLOAD_SIZE_BYTES:-5242880}
     volumes:
       - .:/app
     depends_on:

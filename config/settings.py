@@ -7,7 +7,7 @@ SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-insecure-secret-key-change
 DEBUG = os.environ.get("DJANGO_DEBUG", "0").lower() in ("1", "true", "yes")
 ALLOWED_HOSTS = ["*"]  # PoC only
 
-INSTALLED_APPS = []
+INSTALLED_APPS = ["storage"]
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
@@ -31,3 +31,14 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 REDIS_TTL_SECONDS = int(os.environ.get("REDIS_TTL_SECONDS", "300"))
+
+# Uploads: keep files in memory only (never written to disk) and cap their size.
+MAX_UPLOAD_SIZE_BYTES = int(os.environ.get("MAX_UPLOAD_SIZE_BYTES", "5242880"))
+FILE_UPLOAD_HANDLERS = ["storage.upload_handlers.BoundedMemoryUploadHandler"]
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {"storage": {"handlers": ["console"], "level": "INFO"}},
+}
