@@ -10,14 +10,43 @@ from django.views.decorators.http import require_GET, require_http_methods, requ
 
 from config.redis_client import client
 
+from . import crypto
+
 logger = logging.getLogger(__name__)
 
 KEY_PREFIX = "temporary_storage"
 FILE_FIELDS = ("file_1", "file_2")
+ENCRYPTED_FIELDS = (*FILE_FIELDS, "text")
 
 
 def redis_key(record_id):
     return f"{KEY_PREFIX}:{record_id}"
+
+
+def record_aad(record_id, field):
+    """AAD binding a ciphertext to its format version, record and field.
+
+    Copying a ciphertext to another record (or to another field of the same
+    record) makes GCM authentication fail on decrypt.
+    """
+    return f"{crypto.ENCRYPTION_VERSION}|{redis_key(record_id)}|{field}".encode()
+
+
+def encrypted_mapping(record_id, values):
+    """Redis hash fields holding only ciphertext + nonce for each value."""
+    mapping = {"encryption_version": crypto.ENCRYPTION_VERSION}
+    for field, data in values.items():
+        payload = crypto.encrypt(data, record_aad(record_id, field))
+        mapping[f"{field}_ciphertext"] = payload.ciphertext
+        mapping[f"{field}_nonce"] = payload.nonce
+    return mapping
+
+
+def decrypt_field(record_id, field, ciphertext, nonce, version):
+    """Decrypt one stored value; raises crypto.DecryptionError on any mismatch."""
+    if version != crypto.ENCRYPTION_VERSION.encode() or ciphertext is None or nonce is None:
+        raise crypto.DecryptionError()
+    return crypto.decrypt(ciphertext, nonce, record_aad(record_id, field))
 
 
 @require_GET
@@ -61,19 +90,17 @@ def create_storage(request):
     record_id = str(uuid.uuid4())
     ttl = settings.REDIS_TTL_SECONDS
     key = redis_key(record_id)
+    # Only ciphertext reaches Redis; file names stay as non-sensitive metadata.
+    mapping = encrypted_mapping(
+        record_id,
+        {"file_1": file_1.read(), "file_2": file_2.read(), "text": text.encode("utf-8")},
+    )
+    mapping["file_1_name"] = file_1.name
+    mapping["file_2_name"] = file_2.name
 
     try:
         pipe = client.pipeline(transaction=True)
-        pipe.hset(
-            key,
-            mapping={
-                "file_1_name": file_1.name,
-                "file_1_content": file_1.read(),
-                "file_2_name": file_2.name,
-                "file_2_content": file_2.read(),
-                "text": text,
-            },
-        )
+        pipe.hset(key, mapping=mapping)
         pipe.expire(key, ttl)
         pipe.execute()
     except redis.RedisError:
@@ -103,6 +130,15 @@ def storage_unavailable(action, record_id):
     return JsonResponse({"error": "storage_unavailable"}, status=503)
 
 
+def integrity_error(record_id):
+    # Never log ciphertext, nonces, keys or plaintext; the ID is enough to investigate.
+    logger.error("Encrypted storage payload authentication failed id=%s", record_id)
+    return JsonResponse(
+        {"error": "storage_integrity_error", "detail": "The stored data could not be read."},
+        status=500,
+    )
+
+
 @require_http_methods(["GET", "DELETE"])
 def storage_detail(request, record_id):
     if not is_valid_id(record_id):
@@ -116,15 +152,21 @@ def get_storage(record_id):
     key = redis_key(record_id)
     try:
         pipe = client.pipeline(transaction=True)
-        pipe.hmget(key, "file_1_name", "file_2_name", "text")
+        pipe.hmget(key, "file_1_name", "file_2_name", "text_ciphertext", "text_nonce", "encryption_version")
         pipe.ttl(key)
-        (file_1_name, file_2_name, text), ttl = pipe.execute()
+        (file_1_name, file_2_name, text_ciphertext, text_nonce, version), ttl = pipe.execute()
     except redis.RedisError:
         return storage_unavailable("reading", record_id)
 
     # TTL -2 means the key does not exist (expired or never created).
     if ttl == -2 or file_1_name is None:
         return not_found(record_id)
+
+    # File contents are not returned, so only the text is fetched and decrypted.
+    try:
+        text = decrypt_field(record_id, "text", text_ciphertext, text_nonce, version)
+    except crypto.DecryptionError:
+        return integrity_error(record_id)
 
     return JsonResponse(
         {

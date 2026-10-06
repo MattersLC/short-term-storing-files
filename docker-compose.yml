@@ -10,6 +10,8 @@ services:
       REDIS_PORT: ${REDIS_PORT:-6379}
       REDIS_TTL_SECONDS: ${REDIS_TTL_SECONDS:-300}
       MAX_UPLOAD_SIZE_BYTES: ${MAX_UPLOAD_SIZE_BYTES:-5242880}
+      # Required, no default: taken from the shell or from .env (never committed).
+      STORAGE_ENCRYPTION_KEY: ${STORAGE_ENCRYPTION_KEY:?Set STORAGE_ENCRYPTION_KEY in .env (see README)}
     volumes:
       - .:/app
     depends_on:

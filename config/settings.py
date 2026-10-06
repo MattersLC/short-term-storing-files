@@ -1,5 +1,7 @@
 import os
 
+from storage.crypto import decode_key
+
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-insecure-secret-key-change-me")
 DEBUG = os.environ.get("DJANGO_DEBUG", "0").lower() in ("1", "true", "yes")
 ALLOWED_HOSTS = ["*"]  # PoC only
@@ -34,6 +36,10 @@ USE_TZ = True
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 REDIS_TTL_SECONDS = int(os.environ.get("REDIS_TTL_SECONDS", "300"))
+
+# Application-level encryption (AES-256-GCM) of everything stored in Redis.
+# Required: Django refuses to start without a valid Base64-encoded 32-byte key.
+STORAGE_ENCRYPTION_KEY = decode_key(os.environ.get("STORAGE_ENCRYPTION_KEY"))
 
 # Uploads: keep files in memory only (never written to disk) and cap their size.
 MAX_UPLOAD_SIZE_BYTES = int(os.environ.get("MAX_UPLOAD_SIZE_BYTES", "5242880"))
