@@ -99,6 +99,53 @@ class StorageTests(SimpleTestCase):
         time.sleep(1.5)
         self.assertFalse(client.exists(redis_key(record_id)))
         self.assertEqual(self.client.get(f"{URL}{record_id}/").status_code, 404)
+        # Touch must not bring expired data back.
+        self.assertEqual(self.client.post(f"{URL}{record_id}/touch/").status_code, 404)
+        self.assertFalse(client.exists(redis_key(record_id)))
+
+    @override_settings(REDIS_TTL_SECONDS=60)
+    def test_touch_renews_ttl(self):
+        record_id = self.post(self.payload()).json()["id"]
+        client.expire(redis_key(record_id), 5)
+
+        response = self.client.post(f"{URL}{record_id}/touch/")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["id"], record_id)
+        self.assertTrue(body["touched"])
+        self.assertEqual(body["ttl_seconds"], 60)
+        self.assertGreater(body["ttl_remaining_seconds"], 55)
+        self.assertGreater(client.ttl(redis_key(record_id)), 55)
+
+    def test_touch_missing_record_returns_404(self):
+        record_id = str(uuid.uuid4())
+        response = self.client.post(f"{URL}{record_id}/touch/")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json(), {"id": record_id, "exists": False})
+        self.assertFalse(client.exists(redis_key(record_id)))
+
+    def test_delete_removes_record(self):
+        record_id = self.post(self.payload()).json()["id"]
+
+        response = self.client.delete(f"{URL}{record_id}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"id": record_id, "deleted": True})
+        self.assertFalse(client.exists(redis_key(record_id)))
+
+        self.assertEqual(self.client.get(f"{URL}{record_id}/").status_code, 404)
+        self.assertEqual(self.client.delete(f"{URL}{record_id}/").status_code, 404)
+
+    def test_delete_missing_record_returns_404(self):
+        response = self.client.delete(f"{URL}{uuid.uuid4()}/")
+        self.assertEqual(response.status_code, 404)
+
+
+@override_settings(REDIS_TTL_SECONDS=42, MAX_UPLOAD_SIZE_BYTES=1000)
+class ConfigTests(SimpleTestCase):
+    def test_config_exposes_only_public_settings(self):
+        response = self.client.get("/api/config/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"redis_ttl_seconds": 42, "max_upload_size_bytes": 1000})
 
 
 class IndexPageTests(SimpleTestCase):
@@ -115,6 +162,8 @@ class IndexPageTests(SimpleTestCase):
         self.assertContains(response, 'name="text"')
         self.assertContains(response, "Store in Redis")
         self.assertContains(response, "Refresh status every second")
+        self.assertContains(response, "Refresh TTL")
+        self.assertContains(response, "Delete now")
         self.assertContains(response, 'name="csrfmiddlewaretoken"')
         self.assertIn("csrftoken", response.cookies)
 
@@ -141,3 +190,8 @@ class CsrfTests(SimpleTestCase):
         response = self.csrf_client.post(URL, self.payload(), HTTP_X_CSRFTOKEN=token)
         self.assertEqual(response.status_code, 201)
         client.delete(redis_key(response.json()["id"]))
+
+    def test_touch_and_delete_without_csrf_token_are_rejected(self):
+        record_id = uuid.uuid4()
+        self.assertEqual(self.csrf_client.post(f"{URL}{record_id}/touch/").status_code, 403)
+        self.assertEqual(self.csrf_client.delete(f"{URL}{record_id}/").status_code, 403)
