@@ -12,6 +12,17 @@ INSTALLED_APPS = ["storage"]
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+]
+
+# Rejected CSRF checks answer with JSON so the web UI can show a clear message.
+CSRF_FAILURE_VIEW = "config.views.csrf_failure"
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "APP_DIRS": True,
+    }
 ]
 
 ROOT_URLCONF = "config.urls"

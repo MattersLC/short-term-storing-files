@@ -4,6 +4,8 @@ import uuid
 import redis
 from django.conf import settings
 from django.http import JsonResponse
+from django.shortcuts import render
+from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST
 
 from config.redis_client import client
@@ -16,6 +18,17 @@ FILE_FIELDS = ("file_1", "file_2")
 
 def redis_key(record_id):
     return f"{KEY_PREFIX}:{record_id}"
+
+
+@require_GET
+@ensure_csrf_cookie
+def index(request):
+    """Minimal manual-testing page; it talks to the JSON API via fetch."""
+    return render(
+        request,
+        "storage/index.html",
+        {"max_upload_size_bytes": settings.MAX_UPLOAD_SIZE_BYTES},
+    )
 
 
 @require_POST

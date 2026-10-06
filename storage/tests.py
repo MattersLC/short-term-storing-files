@@ -2,7 +2,7 @@ import time
 import uuid
 
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import SimpleTestCase, override_settings
+from django.test import Client, SimpleTestCase, override_settings
 
 from config.redis_client import client
 
@@ -99,3 +99,45 @@ class StorageTests(SimpleTestCase):
         time.sleep(1.5)
         self.assertFalse(client.exists(redis_key(record_id)))
         self.assertEqual(self.client.get(f"{URL}{record_id}/").status_code, 404)
+
+
+class IndexPageTests(SimpleTestCase):
+    def test_index_returns_200(self):
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Short-term Redis Storage PoC")
+
+    def test_index_contains_expected_form(self):
+        response = self.client.get("/")
+        self.assertContains(response, 'id="store-form"')
+        self.assertContains(response, 'name="file_1"')
+        self.assertContains(response, 'name="file_2"')
+        self.assertContains(response, 'name="text"')
+        self.assertContains(response, "Store in Redis")
+        self.assertContains(response, "Refresh status every second")
+        self.assertContains(response, 'name="csrfmiddlewaretoken"')
+        self.assertIn("csrftoken", response.cookies)
+
+
+class CsrfTests(SimpleTestCase):
+    def setUp(self):
+        self.csrf_client = Client(enforce_csrf_checks=True)
+
+    def payload(self):
+        return {
+            "file_1": SimpleUploadedFile("a.txt", b"a"),
+            "file_2": SimpleUploadedFile("b.txt", b"b"),
+            "text": "hola",
+        }
+
+    def test_post_without_csrf_token_is_rejected(self):
+        response = self.csrf_client.post(URL, self.payload())
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"], "csrf_failed")
+
+    def test_post_with_csrf_token_from_page_succeeds(self):
+        self.csrf_client.get("/")
+        token = self.csrf_client.cookies["csrftoken"].value
+        response = self.csrf_client.post(URL, self.payload(), HTTP_X_CSRFTOKEN=token)
+        self.assertEqual(response.status_code, 201)
+        client.delete(redis_key(response.json()["id"]))

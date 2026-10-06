@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Short-term Redis Storage PoC</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 32px 16px;
+      background: #f3f4f6;
+      color: #1f2937;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      line-height: 1.5;
+    }
+    main { max-width: 640px; margin: 0 auto; }
+    h1 { font-size: 1.5rem; margin: 0 0 4px; }
+    .subtitle { margin: 0 0 24px; color: #6b7280; }
+    .card {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .card h2 { font-size: 1.1rem; margin: 0 0 12px; }
+    label { display: block; font-weight: 600; margin: 12px 0 4px; }
+    input[type="file"], textarea { width: 100%; font: inherit; }
+    textarea { padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; resize: vertical; }
+    .hint { font-size: 0.85rem; color: #6b7280; margin: 4px 0 0; }
+    button {
+      margin-top: 16px;
+      padding: 8px 16px;
+      font: inherit;
+      font-weight: 600;
+      color: #fff;
+      background: #2563eb;
+      border: 0;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: default; }
+    .message { padding: 12px; border-radius: 6px; margin-top: 16px; }
+    .message.success { background: #ecfdf5; border: 1px solid #10b981; color: #065f46; }
+    .message.error { background: #fef2f2; border: 1px solid #ef4444; color: #991b1b; }
+    dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0; }
+    dt { font-weight: 600; }
+    dd { margin: 0; overflow-wrap: anywhere; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .status-stored { color: #047857; font-weight: 700; }
+    .status-expired { color: #b91c1c; font-weight: 700; }
+    .expired-box {
+      padding: 12px;
+      border-radius: 6px;
+      background: #fef2f2;
+      border: 1px solid #ef4444;
+      color: #991b1b;
+    }
+    .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; margin-top: 16px; }
+    .controls button { margin-top: 0; }
+    .controls label { display: inline-flex; gap: 6px; align-items: center; margin: 0; font-weight: 400; }
+    .muted { color: #6b7280; font-size: 0.85rem; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Short-term Redis Storage PoC</h1>
+  <p class="subtitle">Test client for <code>POST /api/storage/</code> and <code>GET /api/storage/&lt;id&gt;/</code>. Expiration is handled by Redis.</p>
+
+  <section class="card">
+    <h2>Store files</h2>
+    <form id="store-form" novalidate>
+      {% csrf_token %}
+      <label for="file_1">File 1</label>
+      <input type="file" id="file_1" name="file_1">
+
+      <label for="file_2">File 2</label>
+      <input type="file" id="file_2" name="file_2">
+
+      <label for="text">Text</label>
+      <textarea id="text" name="text" rows="3"></textarea>
+
+      <p class="hint">Maximum size per file: {{ max_upload_size_bytes }} bytes.</p>
+
+      <button type="submit" id="store-button">Store in Redis</button>
+    </form>
+    <div id="store-message" class="message" role="status" hidden></div>
+  </section>
+
+  <section class="card" id="result-card" hidden>
+    <h2>Stored successfully</h2>
+    <dl>
+      <dt>ID:</dt><dd><code id="result-id"></code></dd>
+      <dt>Configured TTL:</dt><dd id="result-ttl"></dd>
+    </dl>
+    <div class="controls">
+      <button type="button" id="check-button">Check status</button>
+      <label><input type="checkbox" id="auto-refresh"> Refresh status every second</label>
+    </div>
+  </section>
+
+  <section class="card" id="status-card" hidden>
+    <h2>Record status</h2>
+    <div id="status-stored" hidden>
+      <dl>
+        <dt>Status:</dt><dd class="status-stored">Stored</dd>
+        <dt>File 1:</dt><dd id="status-file-1"></dd>
+        <dt>File 2:</dt><dd id="status-file-2"></dd>
+        <dt>Text:</dt><dd id="status-text"></dd>
+        <dt>TTL remaining:</dt><dd id="status-ttl"></dd>
+      </dl>
+    </div>
+    <div id="status-expired" class="expired-box" hidden>
+      <strong>Status: <span class="status-expired">Expired / Not found</span></strong>
+      <p style="margin: 4px 0 0;">Redis automatically deleted this record when its TTL reached zero.</p>
+    </div>
+    <div id="status-error" class="message error" hidden></div>
+    <p class="muted" id="status-checked-at"></p>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  const API_URL = "/api/storage/";
+  const form = document.getElementById("store-form");
+  const storeButton = document.getElementById("store-button");
+  const storeMessage = document.getElementById("store-message");
+  const resultCard = document.getElementById("result-card");
+  const checkButton = document.getElementById("check-button");
+  const autoRefresh = document.getElementById("auto-refresh");
+  const statusCard = document.getElementById("status-card");
+  const statusStored = document.getElementById("status-stored");
+  const statusExpired = document.getElementById("status-expired");
+  const statusError = document.getElementById("status-error");
+
+  // Page state: the ID of the last stored record (memory only).
+  let currentId = null;
+  let refreshTimer = null;
+  let requestInFlight = false;
+
+  function csrfToken() {
+    return form.querySelector("input[name=csrfmiddlewaretoken]").value;
+  }
+
+  async function readJson(response) {
+    try {
+      return await response.json();
+    } catch (e) {
+      return {};
+    }
+  }
+
+  // Translate an API error response into a human-readable message.
+  function errorMessage(status, body) {
+    switch (body.error) {
+      case "missing_fields":
+        return "Missing required fields: " + (body.fields || []).join(", ") + ".";
+      case "file_too_large":
+        return "File too large: " + (body.fields || []).join(", ") +
+          ". Maximum size per file is " + body.max_upload_size_bytes + " bytes.";
+      case "storage_unavailable":
+        return "Redis is not available right now. Try again later.";
+      case "csrf_failed":
+        return body.detail;
+    }
+    if (status === 413) return "Request too large.";
+    if (status === 503) return "Service unavailable.";
+    return "Unexpected server error (HTTP " + status + ").";
+  }
+
+  function showStoreMessage(kind, text) {
+    storeMessage.className = "message " + kind;
+    storeMessage.textContent = text;
+    storeMessage.hidden = false;
+  }
+
+  form.addEventListener("submit", async function (event) {
+    event.preventDefault();
+    storeMessage.hidden = true;
+    storeButton.disabled = true;
+
+    try {
+      const response = await fetch(API_URL, {
+        method: "POST",
+        headers: { "X-CSRFToken": csrfToken() },
+        body: new FormData(form),
+        credentials: "same-origin",
+      });
+      const body = await readJson(response);
+
+      if (response.status !== 201) {
+        showStoreMessage("error", errorMessage(response.status, body));
+        return;
+      }
+
+      currentId = body.id;
+      document.getElementById("result-id").textContent = body.id;
+      document.getElementById("result-ttl").textContent = body.ttl_seconds + " seconds";
+      resultCard.hidden = false;
+      statusCard.hidden = true;
+      showStoreMessage("success", "Stored successfully.");
+
+      if (autoRefresh.checked) startAutoRefresh();
+    } catch (e) {
+      showStoreMessage("error", "Could not reach the server. Check that it is running.");
+    } finally {
+      storeButton.disabled = false;
+    }
+  });
+
+  function showStatus(view) {
+    statusCard.hidden = false;
+    statusStored.hidden = view !== "stored";
+    statusExpired.hidden = view !== "expired";
+    statusError.hidden = view !== "error";
+    document.getElementById("status-checked-at").textContent =
+      "Last checked: " + new Date().toLocaleTimeString();
+  }
+
+  async function checkStatus() {
+    if (!currentId || requestInFlight) return;
+    requestInFlight = true;
+
+    try {
+      const response = await fetch(API_URL + encodeURIComponent(currentId) + "/", {
+        credentials: "same-origin",
+      });
+      const body = await readJson(response);
+
+      if (response.status === 200) {
+        document.getElementById("status-file-1").textContent = body.file_1_name;
+        document.getElementById("status-file-2").textContent = body.file_2_name;
+        document.getElementById("status-text").textContent = body.text;
+        document.getElementById("status-ttl").textContent = body.ttl_remaining_seconds + " seconds";
+        showStatus("stored");
+      } else if (response.status === 404) {
+        stopAutoRefresh();
+        showStatus("expired");
+      } else {
+        statusError.textContent = errorMessage(response.status, body);
+        showStatus("error");
+      }
+    } catch (e) {
+      statusError.textContent = "Could not reach the server. Check that it is running.";
+      showStatus("error");
+    } finally {
+      requestInFlight = false;
+    }
+  }
+
+  function startAutoRefresh() {
+    stopAutoRefresh();
+    autoRefresh.checked = true;
+    checkStatus();
+    refreshTimer = setInterval(checkStatus, 1000);
+  }
+
+  function stopAutoRefresh() {
+    if (refreshTimer !== null) {
+      clearInterval(refreshTimer);
+      refreshTimer = null;
+    }
+    autoRefresh.checked = false;
+  }
+
+  checkButton.addEventListener("click", checkStatus);
+
+  autoRefresh.addEventListener("change", function () {
+    if (autoRefresh.checked) {
+      startAutoRefresh();
+    } else {
+      stopAutoRefresh();
+    }
+  });
+})();
+</script>
+</body>
+</html>

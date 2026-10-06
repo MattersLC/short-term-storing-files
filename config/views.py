@@ -13,3 +13,10 @@ def health(request):
             status=503,
         )
     return JsonResponse({"status": "ok", "redis": "ok"})
+
+
+def csrf_failure(request, reason=""):
+    return JsonResponse(
+        {"error": "csrf_failed", "detail": "CSRF verification failed. Reload the page and try again."},
+        status=403,
+    )
