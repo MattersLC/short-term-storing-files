@@ -1,7 +1,7 @@
 # short-term-storing-files
 
 Prueba de concepto para almacenar archivos de forma temporal (TTL) en Redis usando Django.
-Incluye Django + Redis en Docker Compose, un endpoint de salud y un endpoint para guardar temporalmente dos archivos y un texto en Redis con TTL nativo.
+Incluye Django + Redis en Docker Compose, un endpoint de salud, un endpoint para guardar temporalmente dos archivos y un texto en Redis con TTL nativo, y una interfaz web mínima para probarlo manualmente.
 
 ## Requisitos
 
@@ -16,6 +16,37 @@ docker compose up --build
 ```
 
 La aplicación queda disponible en http://localhost:8000.
+
+## Interfaz web de prueba
+
+Abre http://localhost:8000 en el navegador. Es una única página (Django template + HTML, CSS y
+JavaScript vanilla, sin frameworks ni npm) que llama a la API con `fetch` y `FormData`.
+
+### Flujo de prueba recomendado
+
+1. Selecciona dos archivos (cualquier tipo) en **File 1** y **File 2**.
+2. Escribe un texto.
+3. Pulsa **Store in Redis**: se muestran el ID temporal y el TTL configurado.
+4. Activa **Refresh status every second**.
+5. Observa cómo disminuye **TTL remaining** en cada consulta.
+6. Espera a que el TTL llegue a cero y Redis elimine el registro.
+7. La interfaz recibe un 404, detiene el auto-refresh y muestra **Expired / Not found**.
+
+Para no esperar 5 minutos, levanta el servicio con un TTL corto:
+
+```bash
+REDIS_TTL_SECONDS=20 docker compose up -d web
+```
+
+El navegador sólo actúa como cliente de prueba: no guarda nada (el ID vive en memoria de la
+página) ni calcula la expiración. El TTL lo fija el backend y la eliminación la hace Redis; la
+página se limita a consultar `GET /api/storage/<id>/` y mostrar lo que responde.
+
+### CSRF
+
+La protección CSRF de Django está activa (`CsrfViewMiddleware`). La página obtiene el token con
+`{% csrf_token %}` (y la cookie `csrftoken`) y lo envía en la cabecera `X-CSRFToken` del POST.
+Un POST sin token válido responde HTTP 403 con `{"error": "csrf_failed", ...}`.
 
 ## Probar /health/
 
@@ -36,9 +67,12 @@ Si Redis no está disponible, responde HTTP 503 con `"status": "error"` y `"redi
 ### Guardar dos archivos y un texto
 
 `POST /api/storage/` (multipart/form-data) con los campos obligatorios `file_1`, `file_2` y `text`.
+Requiere token CSRF: primero se obtiene la cookie desde la página principal y se reenvía en la cabecera.
 
 ```bash
-curl -X POST \
+curl -s -c cookies.txt -o /dev/null http://localhost:8000/
+TOKEN=$(awk '$6=="csrftoken"{print $7}' cookies.txt)
+curl -X POST -b cookies.txt -H "X-CSRFToken: $TOKEN" \
   -F "file_1=@./file1.txt" \
   -F "file_2=@./file2.txt" \
   -F "text=Texto de prueba" \
@@ -54,7 +88,9 @@ Respuesta (HTTP 201):
 Errores:
 
 - HTTP 400: falta algún campo o `text` está vacío (`"fields"` indica cuáles).
+- HTTP 403: falta el token CSRF o no es válido.
 - HTTP 413: algún archivo supera `MAX_UPLOAD_SIZE_BYTES`.
+- HTTP 503: Redis no disponible.
 
 ### Consultar si el registro sigue existiendo
 
