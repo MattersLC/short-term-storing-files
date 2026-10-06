@@ -1,152 +1,248 @@
-# short-term-storing-files
+# Short-term storing files
 
-Prueba de concepto para almacenar archivos de forma temporal (TTL) en Redis usando Django.
-Incluye Django + Redis en Docker Compose, un endpoint de salud, un endpoint para guardar temporalmente dos archivos y un texto en Redis con TTL nativo, y una interfaz web mínima para probarlo manualmente.
+## Objetivo
 
-## Requisitos
+Demostrar almacenamiento temporal en Redis de:
 
-- Docker
-- Docker Compose (v2, comando `docker compose`)
+- dos archivos
+- un texto
 
-## Levantar el proyecto
+referenciados posteriormente mediante un identificador aleatorio.
+
+Los datos se envían **una sola vez**; después el cliente sólo conserva el ID. Redis guarda la
+información con TTL: cada uso válido puede renovarlo, un `DELETE` la elimina al instante y, si nadie
+la usa, Redis la borra sola al expirar.
+
+> **Advertencia.** En esta PoC basta con conocer el ID para consultar, renovar o borrar un registro.
+> En una implementación real, **conocer el ID NO debe ser suficiente** para acceder o utilizar material
+> sensible: el recurso tendría que estar asociado al usuario autenticado y a una sesión autorizada.
+
+## Arquitectura
+
+```
+Browser / curl
+      ↓   HTTP (multipart / JSON)
+   Django   (genera el ID, valida, nunca escribe archivos a disco)
+      ↓   redis-py
+    Redis   (Hash + TTL nativo, sin persistencia)
+```
+
+No hay base de datos relacional, Celery ni jobs de limpieza: la expiración la hace Redis.
+
+## Flujo
+
+1. El cliente envía archivos + texto (`POST /api/storage/`).
+2. Django genera un identificador aleatorio (UUID v4).
+3. Redis almacena la información con TTL (`REDIS_TTL_SECONDS`).
+4. El cliente conserva sólo el identificador.
+5. Las consultas posteriores utilizan ese identificador (`GET /api/storage/<id>/`).
+6. La actividad puede renovar el TTL (`POST /api/storage/<id>/touch/`).
+7. `DELETE /api/storage/<id>/` elimina inmediatamente.
+8. La inactividad provoca la expiración automática.
+
+```
+        upload
+          ↓
+   Django genera ID
+          ↓
+   Redis: files + text, TTL configurable
+          │
+          ├── GET    → consultar
+          ├── TOUCH  → renovar TTL
+          ├── DELETE → borrar ahora
+          └── TTL    → borrado automático
+```
+
+### Identificador
+
+El ID es un UUID v4 (`uuid.uuid4()`): 122 bits aleatorios obtenidos de `os.urandom`. No es
+incremental, no deriva de timestamps ni de un hash de los datos, por lo que no es predecible.
+Aun así, es sólo un identificador, no una credencial (ver advertencia arriba).
+
+## Cómo ejecutar
+
+Requisitos: Docker y Docker Compose v2.
 
 ```bash
-cp .env.example .env   # opcional; sin .env se usan valores por defecto
 docker compose up --build
 ```
 
-La aplicación queda disponible en http://localhost:8000.
-
-## Interfaz web de prueba
-
-Abre http://localhost:8000 en el navegador. Es una única página (Django template + HTML, CSS y
-JavaScript vanilla, sin frameworks ni npm) que llama a la API con `fetch` y `FormData`.
-
-### Flujo de prueba recomendado
-
-1. Selecciona dos archivos (cualquier tipo) en **File 1** y **File 2**.
-2. Escribe un texto.
-3. Pulsa **Store in Redis**: se muestran el ID temporal y el TTL configurado.
-4. Activa **Refresh status every second**.
-5. Observa cómo disminuye **TTL remaining** en cada consulta.
-6. Espera a que el TTL llegue a cero y Redis elimine el registro.
-7. La interfaz recibe un 404, detiene el auto-refresh y muestra **Expired / Not found**.
-
-Para no esperar 5 minutos, levanta el servicio con un TTL corto:
+Opcionalmente copia `.env.example` a `.env` para cambiar valores; sin `.env` se usan los valores por
+defecto. Para una demo rápida de expiración:
 
 ```bash
-REDIS_TTL_SECONDS=20 docker compose up -d web
+REDIS_TTL_SECONDS=20 docker compose up --build
 ```
 
-El navegador sólo actúa como cliente de prueba: no guarda nada (el ID vive en memoria de la
-página) ni calcula la expiración. El TTL lo fija el backend y la eliminación la hace Redis; la
-página se limita a consultar `GET /api/storage/<id>/` y mostrar lo que responde.
+## Cómo detener
 
-### CSRF
+```bash
+docker compose down
+```
 
-La protección CSRF de Django está activa (`CsrfViewMiddleware`). La página obtiene el token con
-`{% csrf_token %}` (y la cookie `csrftoken`) y lo envía en la cabecera `X-CSRFToken` del POST.
-Un POST sin token válido responde HTTP 403 con `{"error": "csrf_failed", ...}`.
+Redis corre **sin persistencia** (ver más abajo), así que esto destruye cualquier dato temporal
+restante. Al volver a levantar los servicios, los registros anteriores ya no existen.
 
-## Probar /health/
+## Cómo probar desde navegador
+
+Abre http://localhost:8000. Es una única página (Django template + JavaScript vanilla) que llama a
+la API con `fetch`. El ID vive sólo en memoria de la página.
+
+**Caso A — renovar TTL**
+
+1. Selecciona dos archivos, escribe un texto y pulsa **Store in Redis**.
+2. Activa **Refresh status every second** y observa cómo baja **TTL remaining**.
+3. Pulsa **Refresh TTL**: el TTL vuelve aproximadamente al valor inicial.
+
+**Caso B — borrado explícito**
+
+1. Almacena datos.
+2. Pulsa **Delete now**: se muestra **Status: Deleted / Not found** y se detiene el auto-refresh.
+
+**Caso C — expiración automática**
+
+1. Almacena datos y activa el auto-refresh.
+2. No hagas nada. Cuando el TTL llega a cero, Redis borra el registro y la página muestra
+   **Expired / Not found**.
+
+## Cómo probar mediante curl
+
+Todos los métodos que modifican estado (`POST`, `DELETE`) requieren token CSRF. Se obtiene la cookie
+desde la página principal y se reenvía en la cabecera `X-CSRFToken`:
+
+```bash
+curl -s -c cookies.txt -o /dev/null http://localhost:8000/
+TOKEN=$(awk '$6=="csrftoken"{print $7}' cookies.txt)
+```
+
+### Health
 
 ```bash
 curl -i http://localhost:8000/health/
 ```
 
-Respuesta esperada (HTTP 200):
+`200 {"status": "ok", "redis": "ok"}` o `503` si Redis no está disponible.
 
-```json
-{"status": "ok", "redis": "ok"}
-```
-
-Si Redis no está disponible, responde HTTP 503 con `"status": "error"` y `"redis": "unavailable"`.
-
-## Almacenamiento temporal
-
-### Guardar dos archivos y un texto
-
-`POST /api/storage/` (multipart/form-data) con los campos obligatorios `file_1`, `file_2` y `text`.
-Requiere token CSRF: primero se obtiene la cookie desde la página principal y se reenvía en la cabecera.
+### POST — almacenar
 
 ```bash
-curl -s -c cookies.txt -o /dev/null http://localhost:8000/
-TOKEN=$(awk '$6=="csrftoken"{print $7}' cookies.txt)
 curl -X POST -b cookies.txt -H "X-CSRFToken: $TOKEN" \
-  -F "file_1=@./file1.txt" \
+  -F "file_1=@./file1.bin" \
   -F "file_2=@./file2.txt" \
   -F "text=Texto de prueba" \
   http://localhost:8000/api/storage/
 ```
 
-Respuesta (HTTP 201):
+`201 {"id": "6ba26d1e-7a2f-41f8-aaa1-7c5ce4a4ae7f", "ttl_seconds": 300}`
 
-```json
-{"id": "6ba26d1e-7a2f-41f8-aaa1-7c5ce4a4ae7f", "ttl_seconds": 300}
-```
+Errores: `400` (faltan campos o texto vacío), `403` (CSRF), `413` (archivo mayor que
+`MAX_UPLOAD_SIZE_BYTES`), `503` (Redis no disponible).
 
-Errores:
-
-- HTTP 400: falta algún campo o `text` está vacío (`"fields"` indica cuáles).
-- HTTP 403: falta el token CSRF o no es válido.
-- HTTP 413: algún archivo supera `MAX_UPLOAD_SIZE_BYTES`.
-- HTTP 503: Redis no disponible.
-
-### Consultar si el registro sigue existiendo
+### GET — consultar
 
 ```bash
 curl http://localhost:8000/api/storage/<id>/
 ```
 
-Si existe (HTTP 200), devuelve nombres de archivos, texto y TTL restante leído de Redis
-(no devuelve el contenido de los archivos):
+`200` con nombres de archivo, texto y TTL restante (nunca devuelve el contenido de los archivos):
 
 ```json
-{"id": "<id>", "exists": true, "file_1_name": "file1.txt", "file_2_name": "file2.txt",
+{"id": "<id>", "exists": true, "file_1_name": "file1.bin", "file_2_name": "file2.txt",
  "text": "Texto de prueba", "ttl_remaining_seconds": 287}
 ```
 
-Si expiró o no existe (HTTP 404):
+`404 {"id": "<id>", "exists": false}` si expiró, se borró o nunca existió.
 
-```json
-{"id": "<id>", "exists": false}
-```
-
-### Estructura en Redis
-
-Cada registro es un único **Hash** con TTL en la key `temporary_storage:<uuid>`:
-
-| Campo            | Contenido                         |
-|------------------|-----------------------------------|
-| `file_1_name`    | nombre original de `file_1`       |
-| `file_1_content` | bytes de `file_1` (sin base64)    |
-| `file_2_name`    | nombre original de `file_2`       |
-| `file_2_content` | bytes de `file_2` (sin base64)    |
-| `text`           | texto recibido                    |
-
-Los archivos nunca se escriben en disco: se reciben en memoria y se envían directo a Redis.
-La expiración la hace Redis (`EXPIRE`); no hay jobs de limpieza.
-
-### Inspeccionar Redis desde Docker
+### TOUCH — renovar TTL
 
 ```bash
-docker compose exec redis redis-cli KEYS 'temporary_storage:*'
-docker compose exec redis redis-cli TTL temporary_storage:<id>
-docker compose exec redis redis-cli HKEYS temporary_storage:<id>
-docker compose exec redis redis-cli HGET temporary_storage:<id> text
+curl -X POST -b cookies.txt -H "X-CSRFToken: $TOKEN" \
+  http://localhost:8000/api/storage/<id>/touch/
 ```
 
-`TTL` devuelve los segundos restantes; `-2` significa que la key ya no existe.
+`200 {"id": "<id>", "touched": true, "ttl_seconds": 300, "ttl_remaining_seconds": 300}`
 
-### Probar la expiración manualmente con un TTL corto
+`404 {"id": "<id>", "exists": false}` si la key ya no existe. Usa `EXPIRE`, que sólo actúa sobre
+keys existentes: nunca recrea información expirada.
+
+### DELETE — borrar ahora
 
 ```bash
-REDIS_TTL_SECONDS=10 docker compose up -d web
+curl -X DELETE -b cookies.txt -H "X-CSRFToken: $TOKEN" \
+  http://localhost:8000/api/storage/<id>/
 ```
 
-Haz el POST, consulta el GET (200), espera más de 10 segundos y vuelve a consultar: responde 404
-y `redis-cli EXISTS temporary_storage:<id>` devuelve `0`. Para volver al valor por defecto:
-`docker compose up -d web`.
+`200 {"id": "<id>", "deleted": true}` o `404` si no existe. Conceptualmente representa un logout
+explícito o el cierre voluntario de una futura sesión de firma.
+
+### Configuración pública de la PoC
+
+```bash
+curl http://localhost:8000/api/config/
+```
+
+`200 {"redis_ttl_seconds": 300, "max_upload_size_bytes": 5242880}`. Sólo expone estos dos valores;
+nunca la secret key, passwords ni configuración interna de Redis.
+
+## Cómo inspeccionar Redis
+
+Cada registro es un único **Hash** con TTL en la key `temporary_storage:<id>`:
+
+| Campo            | Contenido                      |
+|------------------|--------------------------------|
+| `file_1_name`    | nombre original de `file_1`    |
+| `file_1_content` | bytes de `file_1` (sin base64) |
+| `file_2_name`    | nombre original de `file_2`    |
+| `file_2_content` | bytes de `file_2` (sin base64) |
+| `text`           | texto recibido                 |
+
+```bash
+# Listar keys de la PoC
+docker compose exec redis redis-cli KEYS "temporary_storage:*"
+
+# TTL restante en segundos (-2 = la key ya no existe)
+docker compose exec redis redis-cli TTL "temporary_storage:<id>"
+
+# Tipo de dato (hash)
+docker compose exec redis redis-cli TYPE "temporary_storage:<id>"
+
+# Sólo metadatos: campos, nombres de archivo y tamaño en bytes de cada contenido
+docker compose exec redis redis-cli HKEYS "temporary_storage:<id>"
+docker compose exec redis redis-cli HMGET "temporary_storage:<id>" file_1_name file_2_name
+docker compose exec redis redis-cli HSTRLEN "temporary_storage:<id>" file_1_content
+docker compose exec redis redis-cli HSTRLEN "temporary_storage:<id>" file_2_content
+```
+
+Evita `HGETALL` o `HGET ... file_*_content`: imprimirían el contenido binario completo de los
+archivos en la terminal. (`KEYS` es aceptable aquí por ser una PoC con pocas keys; en producción se
+usaría `SCAN`.)
+
+## Persistencia de Redis
+
+Esta PoC representa almacenamiento **efímero**, así que Redis se configura en
+`docker-compose.yml` para no persistir nada:
+
+- `--appendonly no`: AOF desactivado.
+- `--save ""`: snapshots RDB desactivados.
+- `/data` montado como `tmpfs`: sin volumen persistente (ni siquiera el volumen anónimo que declara
+  la imagen oficial).
+
+Resultado: `docker compose down` destruye cualquier información temporal restante.
+
+Es una decisión **específica de la PoC**, no una configuración suficiente para producción (donde
+habría que considerar autenticación de Redis, TLS, red aislada, límites de memoria, política de
+expulsión, alta disponibilidad, etc.).
+
+## Variables de entorno
+
+| Variable                | Por defecto | Descripción                                        |
+|-------------------------|-------------|----------------------------------------------------|
+| `REDIS_HOST`            | `redis`     | Host de Redis                                      |
+| `REDIS_PORT`            | `6379`      | Puerto de Redis                                    |
+| `REDIS_TTL_SECONDS`     | `300`       | TTL al crear y al renovar (`touch`) un registro    |
+| `MAX_UPLOAD_SIZE_BYTES` | `5242880`   | Tamaño máximo por archivo (5 MB)                   |
+| `DJANGO_SECRET_KEY`     | (dev key)   | Clave secreta de Django; cámbiala fuera de la demo |
+| `DJANGO_DEBUG`          | `1`         | Modo debug (`1`/`0`)                               |
 
 ## Tests
 
@@ -156,19 +252,48 @@ Requieren Redis, así que se ejecutan dentro del contenedor:
 docker compose exec web python manage.py test
 ```
 
-## Detener los contenedores
+Cubren: almacenamiento (incluye bytes binarios), validaciones 400/413, GET 200/404, TTL configurado,
+renovación con `touch`, `touch` sobre ID inexistente, `DELETE` y GET posterior, CSRF, `/api/config/`
+y una **expiración real** con TTL de 1 s (comprueba que la key desaparece de Redis y que `touch`
+no la recrea).
 
-```bash
-docker compose down
+## Qué demuestra esta PoC
+
+- Almacenamiento binario en Redis (archivos sin base64, nunca escritos a disco).
+- TTL nativo de Redis.
+- Renovación de TTL con cada uso explícito (`touch`).
+- Borrado explícito e inmediato (`DELETE`).
+- Acceso posterior mediante un ID aleatorio, sin reenviar los datos.
+- Expiración automática por inactividad.
+- Reproducibilidad completa mediante Docker.
+
+## Qué NO demuestra
+
+- No hay autenticación.
+- No hay JWT.
+- No hay autorización: cualquiera que conozca el ID puede usarlo.
+- No hay cifrado adicional (los datos están en claro en la memoria de Redis).
+- No hay firma digital.
+- No hay validación de `.cer`.
+- No hay validación de `.key`.
+- No hay manejo de password de e.firma.
+- No es una arquitectura productiva (servidor de desarrollo de Django, `ALLOWED_HOSTS = ["*"]`,
+  Redis sin password ni TLS).
+- No valida cumplimiento normativo.
+
+## Evolución futura
+
+Conceptualmente (no implementado), el mismo patrón podría sostener una sesión de firma:
+
 ```
-
-## Variables de entorno
-
-| Variable            | Por defecto | Descripción                          |
-|---------------------|-------------|--------------------------------------|
-| `DJANGO_SECRET_KEY` | (dev key)   | Clave secreta de Django              |
-| `DJANGO_DEBUG`      | `1`         | Modo debug (`1`/`0`)                 |
-| `REDIS_HOST`        | `redis`     | Host de Redis                        |
-| `REDIS_PORT`        | `6379`      | Puerto de Redis                      |
-| `REDIS_TTL_SECONDS` | `300`       | TTL (segundos) para datos temporales |
-| `MAX_UPLOAD_SIZE_BYTES` | `5242880` | Tamaño máximo por archivo (5 MB)  |
+.cer + .key + password
+        ↓
+creación de signing session   (usuario autenticado, validación de certificado)
+        ↓
+Redis con TTL                 (material cifrado, asociado a usuario + sesión)
+        ↓
+signing_session_id
+        ↓
+requests posteriores usan ese ID (+ autenticación), renuevan TTL al firmar
+y lo eliminan con logout explícito o por inactividad
+```

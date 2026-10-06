@@ -1,7 +1,4 @@
 import os
-from pathlib import Path
-
-BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-insecure-secret-key-change-me")
 DEBUG = os.environ.get("DJANGO_DEBUG", "0").lower() in ("1", "true", "yes")
@@ -28,15 +25,10 @@ TEMPLATES = [
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
-    }
-}
+# No database: all PoC data lives in Redis.
+DATABASES = {}
 
 USE_TZ = True
-DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Redis
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")

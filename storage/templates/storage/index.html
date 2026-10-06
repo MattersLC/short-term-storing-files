@@ -57,6 +57,8 @@
       border: 1px solid #ef4444;
       color: #991b1b;
     }
+    button.secondary { background: #4b5563; }
+    button.danger { background: #dc2626; }
     .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; margin-top: 16px; }
     .controls button { margin-top: 0; }
     .controls label { display: inline-flex; gap: 6px; align-items: center; margin: 0; font-weight: 400; }
@@ -67,7 +69,7 @@
 <body>
 <main>
   <h1>Short-term Redis Storage PoC</h1>
-  <p class="subtitle">Test client for <code>POST /api/storage/</code> and <code>GET /api/storage/&lt;id&gt;/</code>. Expiration is handled by Redis.</p>
+  <p class="subtitle">Test client for the temporary storage API: store, check, refresh TTL and delete. Expiration is handled by Redis.</p>
 
   <section class="card">
     <h2>Store files</h2>
@@ -97,8 +99,11 @@
     </dl>
     <div class="controls">
       <button type="button" id="check-button">Check status</button>
+      <button type="button" id="touch-button" class="secondary">Refresh TTL</button>
+      <button type="button" id="delete-button" class="danger">Delete now</button>
       <label><input type="checkbox" id="auto-refresh"> Refresh status every second</label>
     </div>
+    <div id="action-message" class="message" role="status" hidden></div>
   </section>
 
   <section class="card" id="status-card" hidden>
@@ -116,6 +121,10 @@
       <strong>Status: <span class="status-expired">Expired / Not found</span></strong>
       <p style="margin: 4px 0 0;">Redis automatically deleted this record when its TTL reached zero.</p>
     </div>
+    <div id="status-deleted" class="expired-box" hidden>
+      <strong>Status: <span class="status-expired">Deleted / Not found</span></strong>
+      <p style="margin: 4px 0 0;">The record was deleted from Redis on request (DELETE).</p>
+    </div>
     <div id="status-error" class="message error" hidden></div>
     <p class="muted" id="status-checked-at"></p>
   </section>
@@ -131,16 +140,22 @@
   const storeMessage = document.getElementById("store-message");
   const resultCard = document.getElementById("result-card");
   const checkButton = document.getElementById("check-button");
+  const touchButton = document.getElementById("touch-button");
+  const deleteButton = document.getElementById("delete-button");
+  const actionMessage = document.getElementById("action-message");
   const autoRefresh = document.getElementById("auto-refresh");
   const statusCard = document.getElementById("status-card");
   const statusStored = document.getElementById("status-stored");
   const statusExpired = document.getElementById("status-expired");
+  const statusDeleted = document.getElementById("status-deleted");
   const statusError = document.getElementById("status-error");
 
   // Page state: the ID of the last stored record (memory only).
   let currentId = null;
   let refreshTimer = null;
   let requestInFlight = false;
+  // Bumped by touch/delete so a status response started earlier is ignored.
+  let statusVersion = 0;
 
   function csrfToken() {
     return form.querySelector("input[name=csrfmiddlewaretoken]").value;
@@ -172,10 +187,14 @@
     return "Unexpected server error (HTTP " + status + ").";
   }
 
+  function showMessage(element, kind, text) {
+    element.className = "message " + kind;
+    element.textContent = text;
+    element.hidden = false;
+  }
+
   function showStoreMessage(kind, text) {
-    storeMessage.className = "message " + kind;
-    storeMessage.textContent = text;
-    storeMessage.hidden = false;
+    showMessage(storeMessage, kind, text);
   }
 
   form.addEventListener("submit", async function (event) {
@@ -202,6 +221,8 @@
       document.getElementById("result-ttl").textContent = body.ttl_seconds + " seconds";
       resultCard.hidden = false;
       statusCard.hidden = true;
+      actionMessage.hidden = true;
+      statusVersion++;
       showStoreMessage("success", "Stored successfully.");
 
       if (autoRefresh.checked) startAutoRefresh();
@@ -216,6 +237,7 @@
     statusCard.hidden = false;
     statusStored.hidden = view !== "stored";
     statusExpired.hidden = view !== "expired";
+    statusDeleted.hidden = view !== "deleted";
     statusError.hidden = view !== "error";
     document.getElementById("status-checked-at").textContent =
       "Last checked: " + new Date().toLocaleTimeString();
@@ -224,12 +246,12 @@
   async function checkStatus() {
     if (!currentId || requestInFlight) return;
     requestInFlight = true;
+    const version = statusVersion;
 
     try {
-      const response = await fetch(API_URL + encodeURIComponent(currentId) + "/", {
-        credentials: "same-origin",
-      });
+      const response = await fetch(recordUrl(), { credentials: "same-origin" });
       const body = await readJson(response);
+      if (version !== statusVersion) return;
 
       if (response.status === 200) {
         document.getElementById("status-file-1").textContent = body.file_1_name;
@@ -252,6 +274,63 @@
     }
   }
 
+  function recordUrl(suffix) {
+    return API_URL + encodeURIComponent(currentId) + "/" + (suffix || "");
+  }
+
+  async function sendAction(method, suffix) {
+    statusVersion++;
+    const response = await fetch(recordUrl(suffix), {
+      method: method,
+      headers: { "X-CSRFToken": csrfToken() },
+      credentials: "same-origin",
+    });
+    return { response: response, body: await readJson(response) };
+  }
+
+  async function touchRecord() {
+    if (!currentId) return;
+    touchButton.disabled = true;
+    try {
+      const { response, body } = await sendAction("POST", "touch/");
+      if (response.status === 200) {
+        showMessage(actionMessage, "success",
+          "TTL renewed: " + body.ttl_remaining_seconds + " of " + body.ttl_seconds + " seconds.");
+        await checkStatus();
+      } else if (response.status === 404) {
+        stopAutoRefresh();
+        showMessage(actionMessage, "error", "Nothing to renew: the record no longer exists.");
+        showStatus("expired");
+      } else {
+        showMessage(actionMessage, "error", errorMessage(response.status, body));
+      }
+    } catch (e) {
+      showMessage(actionMessage, "error", "Could not reach the server. Check that it is running.");
+    } finally {
+      touchButton.disabled = false;
+    }
+  }
+
+  async function deleteRecord() {
+    if (!currentId) return;
+    deleteButton.disabled = true;
+    try {
+      const { response, body } = await sendAction("DELETE");
+      if (response.status === 200 || response.status === 404) {
+        stopAutoRefresh();
+        showMessage(actionMessage, response.status === 200 ? "success" : "error",
+          response.status === 200 ? "Record deleted from Redis." : "The record no longer existed.");
+        showStatus("deleted");
+      } else {
+        showMessage(actionMessage, "error", errorMessage(response.status, body));
+      }
+    } catch (e) {
+      showMessage(actionMessage, "error", "Could not reach the server. Check that it is running.");
+    } finally {
+      deleteButton.disabled = false;
+    }
+  }
+
   function startAutoRefresh() {
     stopAutoRefresh();
     autoRefresh.checked = true;
@@ -268,6 +347,8 @@
   }
 
   checkButton.addEventListener("click", checkStatus);
+  touchButton.addEventListener("click", touchRecord);
+  deleteButton.addEventListener("click", deleteRecord);
 
   autoRefresh.addEventListener("change", function () {
     if (autoRefresh.checked) {

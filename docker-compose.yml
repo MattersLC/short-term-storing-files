@@ -1,7 +1,6 @@
 services:
   web:
     build: .
-    command: sh -c "python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:8000"
     ports:
       - "8000:8000"
     environment:
@@ -17,8 +16,13 @@ services:
       redis:
         condition: service_healthy
 
+  # Ephemeral by design (PoC only): no RDB snapshots, no AOF and /data on tmpfs,
+  # so `docker compose down` discards any remaining temporary data.
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    tmpfs:
+      - /data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
