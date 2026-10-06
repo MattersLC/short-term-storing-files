@@ -85,6 +85,7 @@
       <textarea id="text" name="text" rows="3"></textarea>
 
       <p class="hint">Maximum size per file: {{ max_upload_size_bytes }} bytes.</p>
+      <p class="hint">Data is encrypted before being stored in Redis.</p>
 
       <button type="submit" id="store-button">Store in Redis</button>
     </form>
@@ -179,6 +180,8 @@
           ". Maximum size per file is " + body.max_upload_size_bytes + " bytes.";
       case "storage_unavailable":
         return "Redis is not available right now. Try again later.";
+      case "storage_integrity_error":
+        return "The stored record could not be read (integrity check failed).";
       case "csrf_failed":
         return body.detail;
     }
